@@ -41,10 +41,12 @@ COPY requirements.txt .
 # pip 使用阿里云镜像
 RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com -r requirements.txt
 
-# Playwright 使用 npmmirror 国内镜像下载 Chromium
-# 安装Playwright浏览器
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# Playwright 使用 npmmirror 国内镜像
+# PLAYWRIGHT_DOWNLOAD_HOST: ffmpeg 等非浏览器组件的下载
+# PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST: Chrome for Testing 浏览器的下载（路径不同，必须单独指定）
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+ENV PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/chrome-for-testing
+RUN playwright install --with-deps chromium
 
 COPY lanhu_mcp_server.py .
 

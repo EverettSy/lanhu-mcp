@@ -1,53 +1,54 @@
 FROM python:3.10-slim
 
-# 设置工作目录
 WORKDIR /app
 
-# 设置构建时代理参数
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-
-# 设置环境变量
-ENV HTTP_PROXY=${HTTP_PROXY}
-ENV HTTPS_PROXY=${HTTPS_PROXY}
 ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# ✅ 正确换源（适配 Debian 12）
-RUN sed -i 's|http://deb.debian.org|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
+# 替换 apt 源为阿里云镜像（Debian Bookworm）
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
 
-# Playwright 国内源
-ENV PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
-
-# 安装依赖
+# 安装系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl wget gnupg ca-certificates fonts-liberation \
-    libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
-    libcups2 libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 \
-    libnspr4 libnss3 libwayland-client0 \
-    libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2 \
-    libglib2.0-0 libx11-6 libxext6 libxrender1 \
-    libpango-1.0-0 libpangocairo-1.0-0 xdg-utils \
+    curl \
+    wget \
+    gnupg \
+    ca-certificates \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libatspi2.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libwayland-client0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# 安装浏览器（走国内源）
-RUN python -m playwright install chromium
+# pip 使用阿里云镜像
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com -r requirements.txt
 
-# 复制MCP服务器文件
+# Playwright 使用 npmmirror 国内镜像下载 Chromium
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+RUN playwright install --with-deps chromium
+
 COPY lanhu_mcp_server.py .
 
-# 创建数据和日志目录
 RUN mkdir -p /app/data /app/logs
 
-# 清理代理环境变量
-ENV HTTP_PROXY=
-ENV HTTPS_PROXY=
-
-# 暴露端口
 EXPOSE 8000
 
-# 运行MCP服务器（使用HTTP传输）
 CMD ["python", "lanhu_mcp_server.py"]
-

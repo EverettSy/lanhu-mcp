@@ -42,8 +42,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com -r requirements.txt
 
 # Playwright 使用 npmmirror 国内镜像下载 Chromium
-ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
-RUN playwright install --with-deps chromium
+# 安装Playwright浏览器
+RUN playwright install chromium
+RUN playwright install-deps chromium
 
 COPY lanhu_mcp_server.py .
 

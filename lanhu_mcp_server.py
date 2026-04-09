@@ -2748,6 +2748,60 @@ class LanhuExtractor:
         except Exception:
             pass
 
+    @staticmethod
+    def _build_scale_urls(image_url: str, logical_w: float, logical_h: float, slice_scale: int) -> dict:
+        """
+        生成多倍图下载 URL（OSS image/resize 参数）。
+
+        蓝湖切图只存一张图（stored = logical × sliceScale，通常 2x）。
+        不同倍率通过 OSS x-oss-process=image/resize 实现在线裁剪。
+
+        Args:
+            image_url:   OSS 原图 URL（stored = logical × sliceScale）
+            logical_w/h: 逻辑 1x 尺寸（来自 image.size.width/height 或 ddsImage.size）
+            slice_scale: 切图导出倍率（sketch JSON 根节点 sliceScale，通常为 2）
+
+        Returns:
+            dict: 包含 1x/2x/3x 及各平台常用倍率的 URL
+        """
+        if not image_url or not logical_w or not logical_h:
+            return {}
+
+        lw = max(1, int(round(logical_w)))
+        lh = max(1, int(round(logical_h)))
+        stored_w = lw * slice_scale
+        stored_h = lh * slice_scale
+
+        def make_url(w: int, h: int) -> str:
+            w, h = max(1, w), max(1, h)
+            if w == stored_w and h == stored_h:
+                return image_url  # 恰好是存储尺寸，无需 resize
+            return f"{image_url}?x-oss-process=image/resize,w_{w},h_{h}/format,png"
+
+        def js_round(v: float) -> int:
+            """模拟 JavaScript Math.round（.5 向上取整）"""
+            import math
+            return math.floor(v + 0.5)
+
+        # iOS 按 stored/4 基准（hardcoded by Lanhu frontend）
+        ios_base = stored_w / 4
+        return {
+            # Web / 通用
+            '1x': make_url(lw * 1, lh * 1),
+            '2x': make_url(lw * 2, lh * 2),   # = stored，原图
+            '3x': make_url(lw * 3, lh * 3),
+            # iOS（@2x = Web @1x = logical size）
+            'ios_1x':  make_url(max(1, js_round(ios_base * 1)), max(1, js_round(stored_h / 4 * 1))),
+            'ios_2x':  make_url(max(1, js_round(ios_base * 2)), max(1, js_round(stored_h / 4 * 2))),
+            'ios_3x':  make_url(max(1, js_round(ios_base * 3)), max(1, js_round(stored_h / 4 * 3))),
+            # Android
+            'android_mdpi':    make_url(max(1, js_round(stored_w / 4 * 1)),   max(1, js_round(stored_h / 4 * 1))),
+            'android_hdpi':    make_url(max(1, js_round(stored_w / 4 * 1.5)), max(1, js_round(stored_h / 4 * 1.5))),
+            'android_xhdpi':   make_url(max(1, js_round(stored_w / 4 * 2)),   max(1, js_round(stored_h / 4 * 2))),
+            'android_xxhdpi':  make_url(max(1, js_round(stored_w / 4 * 3)),   max(1, js_round(stored_h / 4 * 3))),
+            'android_xxxhdpi': make_url(stored_w, stored_h),               # = 原图
+        }
+
     async def get_design_slices_info(self, image_id: str, team_id: str, project_id: str,
                                      include_metadata: bool = True) -> dict:
         """
@@ -2784,6 +2838,9 @@ class LanhuExtractor:
         json_response = await self.client.get(json_url)
         sketch_data = json_response.json()
 
+        # sliceScale：切图导出倍率（通常为 2，即存储尺寸 = 逻辑尺寸 × 2）
+        slice_scale = int(sketch_data.get('sliceScale') or sketch_data.get('exportScale') or 2)
+
         # 3. 递归提取所有切图
         slices = []
 
@@ -2813,11 +2870,18 @@ class LanhuExtractor:
                 # 优先使用PNG格式，如果没有则使用SVG
                 download_url = image_data.get('imageUrl') or image_data.get('svgUrl')
 
-                # 计算尺寸 (从frame或bounds获取)
+                # 逻辑尺寸：image.size 是 1x 逻辑像素（stored = logical × sliceScale）
+                img_size = image_data.get('size') or {}
+                logical_w = img_size.get('width') or 0
+                logical_h = img_size.get('height') or 0
+
+                # 计算尺寸 (从frame或bounds获取, 作为 fallback)
                 frame = obj.get('frame') or obj.get('bounds') or {}
-                width = frame.get('width', 0)
-                height = frame.get('height', 0)
-                size_str = f"{int(width)}x{int(height)}" if width and height else "unknown"
+                if not logical_w:
+                    logical_w = frame.get('width', 0)
+                if not logical_h:
+                    logical_h = frame.get('height', 0)
+                size_str = f"{int(logical_w)}x{int(logical_h)}" if logical_w and logical_h else "unknown"
 
                 slice_info = {
                     'id': obj.get('id'),
@@ -2827,6 +2891,17 @@ class LanhuExtractor:
                     'size': size_str,
                     'format': 'png' if image_data.get('imageUrl') else 'svg',
                 }
+
+                # 多倍图 URL（1x/2x/3x 及各平台倍率）
+                if download_url and image_data.get('imageUrl'):
+                    slice_info['scale_urls'] = self._build_scale_urls(
+                        download_url, logical_w, logical_h, slice_scale
+                    )
+                    slice_info['logical_size'] = {
+                        'width': int(logical_w),
+                        'height': int(logical_h),
+                        'note': f'1x logical px; stored at {slice_scale}x = {int(logical_w * slice_scale)}x{int(logical_h * slice_scale)}px'
+                    }
 
                 # 添加位置信息
                 x = frame.get('x') or frame.get('left', 0)
@@ -2882,14 +2957,35 @@ class LanhuExtractor:
 
             # 旧版结构: 检查 ddsImage 字段 (兼容)
             elif obj.get('ddsImage') and obj['ddsImage'].get('imageUrl'):
+                dds = obj['ddsImage']
+                dds_url = dds['imageUrl']
+                dds_size = dds.get('size') or {}
+                if isinstance(dds_size, dict):
+                    logical_w = dds_size.get('width') or 0
+                    logical_h = dds_size.get('height') or 0
+                else:
+                    logical_w = logical_h = 0
+                size_str = f"{int(logical_w)}x{int(logical_h)}" if logical_w and logical_h else str(dds_size)
+
                 slice_info = {
                     'id': obj.get('id'),
                     'name': current_name,
                     'type': obj.get('type') or obj.get('ddsType'),
-                    'download_url': obj['ddsImage']['imageUrl'],
-                    'size': obj['ddsImage'].get('size', 'unknown'),
+                    'download_url': dds_url,
+                    'size': size_str,
                     'format': 'png',
                 }
+
+                # 多倍图 URL
+                if dds_url and logical_w:
+                    slice_info['scale_urls'] = self._build_scale_urls(
+                        dds_url, logical_w, logical_h, slice_scale
+                    )
+                    slice_info['logical_size'] = {
+                        'width': int(logical_w),
+                        'height': int(logical_h),
+                        'note': f'1x logical px; stored at {slice_scale}x = {int(logical_w * slice_scale)}x{int(logical_h * slice_scale)}px'
+                    }
 
                 # 添加位置信息
                 if 'left' in obj and 'top' in obj:
@@ -2970,6 +3066,7 @@ class LanhuExtractor:
             'design_id': image_id,
             'design_name': result['name'],
             'version': latest_version['version_info'],
+            'slice_scale': slice_scale,
             'canvas_size': {
                 'width': result.get('width'),
                 'height': result.get('height')
@@ -5242,7 +5339,42 @@ async def lanhu_get_design_slices(
         ai_workflow_guide = {
             "instructions": "🤖 AI assistant must follow this workflow to process slice download tasks",
             "language_requirement": "⚠️ IMPORTANT: Always respond to user in Chinese (中文回复)",
+            "FIRST_ACTION_REQUIRED": {
+                "action": "ASK_USER_SCALE_PREFERENCE",
+                "description": "在开始下载前，必须先向用户确认平台和倍率偏好",
+                "question_template": "请问您需要下载哪个平台的切图？\n\n**Web 端**\n- `1x` — {w1x}×{h1x}px（CSS 1倍图）\n- `2x` — {w2x}×{h2x}px（Retina / 原图，推荐）\n- `3x` — {w3x}×{h3x}px（超高清）\n\n**iOS**\n- `ios_1x` — @1x\n- `ios_2x` — @2x（同 Web 1x）\n- `ios_3x` — @3x\n\n**Android**\n- `android_xhdpi` — xhdpi（同 Web 1x）\n- `android_xxhdpi` — xxhdpi（同 iOS @3x）\n- `android_xxxhdpi` — xxxhdpi（原图）\n- 全套（mdpi/hdpi/xhdpi/xxhdpi/xxxhdpi）\n\n> 默认推荐：**Web 2x**（最高清，直接使用原图 URL，无需额外处理）",
+                "how_to_use_scale_urls": "每个 slice 的 scale_urls 字段包含所有倍率的 URL，根据用户选择取对应 key 的 URL 下载即可",
+                "scale_url_keys": {
+                    "Web 1x": "scale_urls.1x",
+                    "Web 2x (原图)": "scale_urls.2x",
+                    "Web 3x": "scale_urls.3x",
+                    "iOS @1x": "scale_urls.ios_1x",
+                    "iOS @2x": "scale_urls.ios_2x",
+                    "iOS @3x": "scale_urls.ios_3x",
+                    "Android mdpi":    "scale_urls.android_mdpi",
+                    "Android hdpi":    "scale_urls.android_hdpi",
+                    "Android xhdpi":   "scale_urls.android_xhdpi",
+                    "Android xxhdpi":  "scale_urls.android_xxhdpi",
+                    "Android xxxhdpi": "scale_urls.android_xxxhdpi"
+                },
+                "multi_scale_naming": {
+                    "Web 1x+2x":  "filename.png / filename@2x.png",
+                    "iOS all":    "filename.png / filename@2x.png / filename@3x.png",
+                    "Android all": "mipmap-mdpi/f.png, mipmap-hdpi/f.png, ... mipmap-xxxhdpi/f.png"
+                }
+            },
             "workflow_steps": [
+                {
+                    "step": 0,
+                    "title": "询问用户下载平台和倍率（必须在下载前完成）",
+                    "mandatory": True,
+                    "tasks": [
+                        "展示切图列表摘要（总数 + 前3个名字）给用户",
+                        "列出可选平台：Web（1x/2x/3x）、iOS（@1x/@2x/@3x）、Android（全套/单倍率）",
+                        "等待用户明确选择，不要擅自假设默认值",
+                        "若用户不在意，推荐 Web 2x（原图 URL，无 OSS 参数，最简单）"
+                    ]
+                },
                 {
                     "step": 1,
                     "title": "Create TODO Task Plan",
@@ -5334,12 +5466,13 @@ async def lanhu_get_design_slices(
             "execution_workflow": {
                 "description": "Complete workflow that AI must autonomously complete",
                 "steps": [
+                    "Step 0: 展示切图摘要，询问用户需要哪个平台/倍率（必须等待用户回复）",
                     "Step 1: Call lanhu_get_design_slices(url, design_name) to get slice info",
                     "Step 2: Create TODO task plan (use todo_write tool)",
                     "Step 3: Detect current operating system type",
                     "Step 4: Detect available download tools by priority",
                     "Step 5: Identify project type and determine output directory",
-                    "Step 6: Generate smart filenames based on slice info",
+                    "Step 6: 根据用户选择的倍率，从 slice.scale_urls 取对应 URL，生成智能文件名",
                     "Step 7: Select optimal download solution based on detection results",
                     "Step 8: Execute batch download task",
                     "Step 9: Verify download results",
@@ -5347,6 +5480,11 @@ async def lanhu_get_design_slices(
                 ]
             },
             "important_notes": [
+                "🎯 AI 必须先询问用户需要下载哪个平台/倍率，不能擅自开始下载",
+                "📐 每个 slice 都有 scale_urls 字段，包含 1x/2x/3x 及 iOS/Android 全套 URL",
+                "⭐ Web 2x = scale_urls.2x = 原图 URL（无 OSS 参数，最简单），推荐首选",
+                "🍎 iOS 全套下载：ios_1x/ios_2x/ios_3x，文件名加 @2x/@3x 后缀",
+                "🤖 Android 全套下载：android_mdpi~xxxhdpi，分别放入对应 mipmap 目录",
                 "🎯 AI must proactively complete the entire workflow, don't just return info and wait for user action",
                 "📋 AI must use todo_write tool to create task plan, ensure orderly progress",
                 "🔍 AI must detect environment and tool availability first, then select download solution",

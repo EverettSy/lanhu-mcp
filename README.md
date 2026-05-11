@@ -263,7 +263,19 @@ docker-compose down              # 停止
 
 在支持 MCP 的 AI 客户端（如 Claude Code、Cursor、Windsurf）中配置：
 
-**Cursor 配置示例：**
+**Claude Code 配置示例：**
+```json
+{
+  "mcpServers": {
+    "lanhu": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp?role=Developer&name=YourName"
+    }
+  }
+}
+```
+
+**Cursor / Windsurf 等其他客户端配置示例：**
 ```json
 {
   "mcpServers": {
@@ -881,7 +893,7 @@ black lanhu_mcp_server.py
 
 - 提交 Issue: [GitHub Issues](https://github.com/dsphper/lanhu-mcp/issues)
 - 邮件: dsphper@gmail.com
-<p align="center"><img src="images/wechat.jpg?v=20260409" alt="微信群二维码" width="400" /></p>
+<p align="center"><img src="images/wechat.jpg?v=20260415" alt="微信群二维码" width="400" /></p>
 
 ## 🗺️ 路线图
 
@@ -963,4 +975,4 @@ black lanhu_mcp_server.py
 
 如有任何疑问或建议，欢迎通过 [GitHub Issues](https://github.com/dsphper/lanhu-mcp/issues) 与我们交流。
 
-<!-- Last checked: 2026-04-09 09:05 -->
+<!-- Last checked: 2026-05-11 02:56 -->

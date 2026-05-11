@@ -1480,43 +1480,88 @@ def minify_html(html: str) -> str:
 def _localize_image_urls(html_code: str, design_name: str) -> tuple[str, dict]:
     """
     将生成的 HTML 中的远程图片 URL 替换为本地路径占位符，并返回下载映射表。
-    处理 <img src="..."> 和 CSS url(...) 中的远程地址。
+    文件名优先使用 CSS 类名（img class 属性 / CSS 规则选择器），退而使用计数器。
+    同一 URL 复用同一本地路径（相同图片不重复下载）。
     """
-    url_mapping = {}
+    url_to_localpath: dict[str, str] = {}  # remote_url -> local_path, dedup
+    url_mapping: dict[str, str] = {}       # local_path -> remote_url
+    used_names: set[str] = set()
     counter = [0]
 
-    def _make_local_name(remote_url: str) -> str:
-        parsed = urlparse(remote_url)
-        path = parsed.path
-        ext = '.png'
+    def _get_ext(remote_url: str) -> str:
+        path = urlparse(remote_url).path
         if '.' in path.split('/')[-1]:
             ext = '.' + path.split('/')[-1].rsplit('.', 1)[-1]
-            if ext not in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'):
-                ext = '.png'
-        counter[0] += 1
-        return f"img_{counter[0]}{ext}"
+            if ext in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'):
+                return ext
+        return '.png'
 
-    def _replace_img_src(match):
-        url = match.group(1)
-        if not url or not url.startswith('http'):
-            return match.group(0)
-        local_name = _make_local_name(url)
-        local_path = f"./assets/slices/{local_name}"
-        url_mapping[local_path] = url
-        return f'src="{local_path}"'
+    def _sanitize(name: str) -> str:
+        """去除循环后缀（-0/-1/...），保留主类名。"""
+        return re.sub(r'-\d+$', '', name)
 
+    def _unique_name(base: str, ext: str) -> str:
+        candidate = f"{base}{ext}"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        i = 2
+        while True:
+            candidate = f"{base}_{i}{ext}"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return candidate
+            i += 1
+
+    def _get_localpath(remote_url: str, hint_class: str = None) -> str:
+        if remote_url in url_to_localpath:
+            return url_to_localpath[remote_url]
+        ext = _get_ext(remote_url)
+        if hint_class:
+            base = _sanitize(hint_class)
+        else:
+            counter[0] += 1
+            base = f"img_{counter[0]}"
+        name = _unique_name(base, ext)
+        local_path = f"./assets/slices/{name}"
+        url_mapping[local_path] = remote_url
+        url_to_localpath[remote_url] = local_path
+        return local_path
+
+    # Step 1: 从 CSS 规则中收集 url -> class_name 映射
+    # 格式：.classname { ... background: url(https://...) ... }
+    url_to_css_class: dict[str, str] = {}
+    css_block = re.search(r'<style>(.*?)</style>', html_code, re.DOTALL)
+    if css_block:
+        for rule_m in re.finditer(r'\.([\w-]+)\s*\{([^}]*)\}', css_block.group(1), re.DOTALL):
+            cls = rule_m.group(1)
+            for url_m in re.finditer(r'url\([\'"]?(https?://[^\'") ]+)[\'"]?', rule_m.group(2)):
+                url_to_css_class.setdefault(url_m.group(1), cls)
+
+    # Step 2: 替换 <img src="...">，优先用 img 的 class 属性
+    def _replace_img_tag(tag_match):
+        tag = tag_match.group(0)
+        src_m = re.search(r'src=["\']?(https?://[^"\'>\s]+)["\']?', tag)
+        if not src_m:
+            return tag
+        url = src_m.group(1)
+        cls_m = re.search(r'class=["\']([^"\']+)["\']', tag) or re.search(r'class=([^"\'>\s]+)', tag)
+        hint = cls_m.group(1).split()[0] if cls_m else url_to_css_class.get(url)
+        local_path = _get_localpath(url, hint)
+        return tag[:src_m.start(1) - tag_match.start()] + local_path + tag[src_m.end(1) - tag_match.start():]
+
+    # 先整体替换 <img> 标签（以保留 class 上下文）
+    result = re.sub(r'<img\b[^>]*>', _replace_img_tag, html_code)
+
+    # Step 3: 替换 CSS url(...) 背景图，用 CSS 类名作文件名
     def _replace_css_url(match):
         url = match.group(1).strip('\'"')
         if not url or not url.startswith('http'):
             return match.group(0)
-        local_name = _make_local_name(url)
-        local_path = f"./assets/slices/{local_name}"
-        url_mapping[local_path] = url
+        hint = url_to_css_class.get(url)
+        local_path = _get_localpath(url, hint)
         return f"url('{local_path}')"
 
-    result = re.sub(r'src="(https?://[^"]*)"', _replace_img_src, html_code)
-    result = re.sub(r"src='(https?://[^']*)'", _replace_img_src, result)
-    result = re.sub(r'src=(https?://[^\s>\'\"]+)', _replace_img_src, result)
     result = re.sub(r'url\(([\'"]*https?://[^\)]*)\)', _replace_css_url, result)
 
     return result, url_mapping
@@ -2802,6 +2847,50 @@ class LanhuExtractor:
             'android_xxxhdpi': make_url(stored_w, stored_h),               # = 原图
         }
 
+    @staticmethod
+    def _build_ps_scale_urls(image_url: str, base_w: float, base_h: float) -> dict:
+        """
+        生成 Photoshop 稿切图的多倍图下载 URL。
+
+        PS 稿里 layer.width/height 对应蓝湖切图面板的 @2x 像素尺寸，
+        也就是 iOS @2x / Android xhdpi。以 40x40 为例：
+        1x/mdpi = 20x20, 2x/xhdpi = 40x40, 3x/xxhdpi = 60x60。
+        """
+        if not image_url or not base_w or not base_h:
+            return {}
+
+        bw = max(1, int(round(base_w)))
+        bh = max(1, int(round(base_h)))
+
+        def js_round(v: float) -> int:
+            """模拟 JavaScript Math.round（.5 向上取整）"""
+            import math
+            return math.floor(v + 0.5)
+
+        def make_url(w: int, h: int) -> str:
+            w, h = max(1, w), max(1, h)
+            return f"{image_url}?x-oss-process=image/resize,w_{w},h_{h}/format,png"
+
+        one_x_w = bw / 2
+        one_x_h = bh / 2
+
+        return {
+            # Web / 通用
+            '1x': make_url(js_round(one_x_w), js_round(one_x_h)),
+            '2x': make_url(bw, bh),
+            '3x': make_url(js_round(one_x_w * 3), js_round(one_x_h * 3)),
+            # iOS
+            'ios_1x': make_url(js_round(one_x_w), js_round(one_x_h)),
+            'ios_2x': make_url(bw, bh),
+            'ios_3x': make_url(js_round(one_x_w * 3), js_round(one_x_h * 3)),
+            # Android
+            'android_mdpi': make_url(js_round(one_x_w), js_round(one_x_h)),
+            'android_hdpi': make_url(js_round(one_x_w * 1.5), js_round(one_x_h * 1.5)),
+            'android_xhdpi': make_url(bw, bh),
+            'android_xxhdpi': make_url(js_round(one_x_w * 3), js_round(one_x_h * 3)),
+            'android_xxxhdpi': make_url(js_round(one_x_w * 4), js_round(one_x_h * 4)),
+        }
+
     async def get_design_slices_info(self, image_id: str, team_id: str, project_id: str,
                                      include_metadata: bool = True) -> dict:
         """
@@ -2839,7 +2928,16 @@ class LanhuExtractor:
         sketch_data = json_response.json()
 
         # sliceScale：切图导出倍率（通常为 2，即存储尺寸 = 逻辑尺寸 × 2）
-        slice_scale = int(sketch_data.get('sliceScale') or sketch_data.get('exportScale') or 2)
+        # Figma JSON 将 sliceScale 存在 meta 子对象中
+        meta = sketch_data.get('meta') or {}
+        slice_scale = int(
+            sketch_data.get('sliceScale') or
+            sketch_data.get('exportScale') or
+            meta.get('sliceScale') or
+            2
+        )
+        # Figma 设计：bitmapLayer(hasExportImage=True) 才是真切图，shapeLayer 的 ddsImage 是图片填充层
+        is_figma = (meta.get('host') or {}).get('name') == 'figma'
 
         # 3. 递归提取所有切图
         slices = []
@@ -2848,12 +2946,12 @@ class LanhuExtractor:
             """
             递归查找切图，兼容新旧两种JSON结构
 
-            新版结构 (2026+):
+            Figma 结构:
             - 根节点: artboard.layers[]
-            - 切图字段: image.imageUrl / image.svgUrl
-            - 图层类型: bitmapLayer, shapeLayer, textLayer, groupLayer
+            - 真切图: bitmapLayer + hasExportImage=True，字段 image.imageUrl
+            - 图片填充（跳过）: shapeLayer/groupLayer + hasExportDDSImage=True，字段 ddsImage.imageUrl
 
-            旧版结构 (2025-):
+            旧版 Sketch 结构:
             - 根节点: info[]
             - 切图字段: ddsImage.imageUrl
             """
@@ -2863,100 +2961,111 @@ class LanhuExtractor:
             current_name = obj.get('name', '')
             current_path = f"{layer_path}/{current_name}" if layer_path else current_name
 
-            # 新版结构: 检查 image 字段 (优先)
+            # 检查 image 字段
+            # Figma: bitmapLayer + hasExportImage=True 才是真切图，其余跳过
             if obj.get('image') and (obj['image'].get('imageUrl') or obj['image'].get('svgUrl')):
-                image_data = obj['image']
+                if is_figma and not obj.get('hasExportImage'):
+                    pass  # Figma 图片填充层，不是切图
+                else:
+                    image_data = obj['image']
 
-                # 优先使用PNG格式，如果没有则使用SVG
-                download_url = image_data.get('imageUrl') or image_data.get('svgUrl')
+                    # 优先使用PNG格式，如果没有则使用SVG
+                    download_url = image_data.get('imageUrl') or image_data.get('svgUrl')
 
-                # 逻辑尺寸：image.size 是 1x 逻辑像素（stored = logical × sliceScale）
-                img_size = image_data.get('size') or {}
-                logical_w = img_size.get('width') or 0
-                logical_h = img_size.get('height') or 0
+                    # 逻辑尺寸：image.size 是 1x 逻辑像素（stored = logical × sliceScale）
+                    img_size = image_data.get('size') or {}
+                    logical_w = img_size.get('width') or 0
+                    logical_h = img_size.get('height') or 0
 
-                # 计算尺寸 (从frame或bounds获取, 作为 fallback)
-                frame = obj.get('frame') or obj.get('bounds') or {}
-                if not logical_w:
-                    logical_w = frame.get('width', 0)
-                if not logical_h:
-                    logical_h = frame.get('height', 0)
-                size_str = f"{int(logical_w)}x{int(logical_h)}" if logical_w and logical_h else "unknown"
+                    # frame fallback：Figma bitmapLayer 的 frame 已是逻辑像素（1x），直接用
+                    if not logical_w or not logical_h:
+                        frame = obj.get('frame') or obj.get('bounds') or {}
+                        frame_w = frame.get('width', 0)
+                        frame_h = frame.get('height', 0)
+                        if frame_w:
+                            logical_w = frame_w
+                            logical_h = frame_h
+                    size_str = f"{int(logical_w)}x{int(logical_h)}" if logical_w and logical_h else "unknown"
 
-                slice_info = {
-                    'id': obj.get('id'),
-                    'name': current_name,
-                    'type': obj.get('type') or obj.get('layerType') or 'bitmap',
-                    'download_url': download_url,
-                    'size': size_str,
-                    'format': 'png' if image_data.get('imageUrl') else 'svg',
-                }
-
-                # 多倍图 URL（1x/2x/3x 及各平台倍率）
-                if download_url and image_data.get('imageUrl'):
-                    slice_info['scale_urls'] = self._build_scale_urls(
-                        download_url, logical_w, logical_h, slice_scale
-                    )
-                    slice_info['logical_size'] = {
-                        'width': int(logical_w),
-                        'height': int(logical_h),
-                        'note': f'1x logical px; stored at {slice_scale}x = {int(logical_w * slice_scale)}x{int(logical_h * slice_scale)}px'
+                    frame = obj.get('frame') or obj.get('bounds') or {}
+                    slice_info = {
+                        'id': obj.get('id'),
+                        'name': current_name,
+                        'type': obj.get('type') or obj.get('layerType') or 'bitmap',
+                        'download_url': download_url,
+                        'size': size_str,
+                        'format': 'png' if image_data.get('imageUrl') else 'svg',
                     }
 
-                # 添加位置信息
-                x = frame.get('x') or frame.get('left', 0)
-                y = frame.get('y') or frame.get('top', 0)
-                if x is not None or y is not None:
-                    slice_info['position'] = {
-                        'x': int(x),
-                        'y': int(y)
-                    }
+                    # SVG URL（Figma bitmapLayer 同时提供 SVG）
+                    if image_data.get('svgUrl') and image_data.get('imageUrl'):
+                        slice_info['svg_url'] = image_data['svgUrl']
 
-                # 添加父图层信息
-                if parent_name:
-                    slice_info['parent_name'] = parent_name
+                    # 多倍图 URL（1x/2x/3x 及各平台倍率）
+                    if download_url and image_data.get('imageUrl'):
+                        slice_info['scale_urls'] = self._build_scale_urls(
+                            download_url, logical_w, logical_h, slice_scale
+                        )
+                        slice_info['logical_size'] = {
+                            'width': int(logical_w),
+                            'height': int(logical_h),
+                            'note': f'1x logical px; stored at {slice_scale}x = {int(logical_w * slice_scale)}x{int(logical_h * slice_scale)}px'
+                        }
 
-                slice_info['layer_path'] = current_path
+                    # 添加位置信息
+                    x = frame.get('x') or frame.get('left', 0)
+                    y = frame.get('y') or frame.get('top', 0)
+                    if x is not None or y is not None:
+                        slice_info['position'] = {
+                            'x': int(x),
+                            'y': int(y)
+                        }
 
-                # 如果需要详细元数据
-                if include_metadata:
-                    metadata = {}
+                    # 添加父图层信息
+                    if parent_name:
+                        slice_info['parent_name'] = parent_name
 
-                    # 填充颜色
-                    if obj.get('fills'):
-                        metadata['fills'] = obj['fills']
+                    slice_info['layer_path'] = current_path
 
-                    # 边框
-                    if obj.get('borders') or obj.get('strokes'):
-                        metadata['borders'] = obj.get('borders') or obj.get('strokes')
+                    # 如果需要详细元数据
+                    if include_metadata:
+                        metadata = {}
 
-                    # 透明度
-                    if 'opacity' in obj:
-                        metadata['opacity'] = obj['opacity']
+                        # 填充颜色
+                        if obj.get('fills'):
+                            metadata['fills'] = obj['fills']
 
-                    # 旋转
-                    if obj.get('rotation'):
-                        metadata['rotation'] = obj['rotation']
+                        # 边框
+                        if obj.get('borders') or obj.get('strokes'):
+                            metadata['borders'] = obj.get('borders') or obj.get('strokes')
 
-                    # 文本样式
-                    if obj.get('textStyle'):
-                        metadata['text_style'] = obj['textStyle']
+                        # 透明度
+                        if 'opacity' in obj:
+                            metadata['opacity'] = obj['opacity']
 
-                    # 阴影
-                    if obj.get('shadows'):
-                        metadata['shadows'] = obj['shadows']
+                        # 旋转
+                        if obj.get('rotation'):
+                            metadata['rotation'] = obj['rotation']
 
-                    # 圆角
-                    if obj.get('radius') or obj.get('cornerRadius'):
-                        metadata['border_radius'] = obj.get('radius') or obj.get('cornerRadius')
+                        # 文本样式
+                        if obj.get('textStyle'):
+                            metadata['text_style'] = obj['textStyle']
 
-                    if metadata:
-                        slice_info['metadata'] = metadata
+                        # 阴影
+                        if obj.get('shadows'):
+                            metadata['shadows'] = obj['shadows']
 
-                slices.append(slice_info)
+                        # 圆角
+                        if obj.get('radius') or obj.get('cornerRadius'):
+                            metadata['border_radius'] = obj.get('radius') or obj.get('cornerRadius')
 
-            # 旧版结构: 检查 ddsImage 字段 (兼容)
-            elif obj.get('ddsImage') and obj['ddsImage'].get('imageUrl'):
+                        if metadata:
+                            slice_info['metadata'] = metadata
+
+                    slices.append(slice_info)
+
+            # 旧版结构: 检查 ddsImage 字段（Sketch 兼容；Figma 的 ddsImage 是图片填充层，不是切图）
+            elif obj.get('ddsImage') and obj['ddsImage'].get('imageUrl') and not is_figma:
                 dds = obj['ddsImage']
                 dds_url = dds['imageUrl']
                 dds_size = dds.get('size') or {}
@@ -2965,6 +3074,16 @@ class LanhuExtractor:
                     logical_h = dds_size.get('height') or 0
                 else:
                     logical_w = logical_h = 0
+
+                # 旧版 Sketch: ddsImage.size 缺失时从 frame 兜底（frame 是逻辑像素）
+                if not logical_w or not logical_h:
+                    frame = obj.get('frame') or obj.get('bounds') or {}
+                    frame_w = frame.get('width', 0)
+                    frame_h = frame.get('height', 0)
+                    if frame_w:
+                        logical_w = frame_w
+                        logical_h = frame_h
+
                 size_str = f"{int(logical_w)}x{int(logical_h)}" if logical_w and logical_h else str(dds_size)
 
                 slice_info = {
@@ -3037,19 +3156,11 @@ class LanhuExtractor:
 
                 slices.append(slice_info)
 
-            # 递归处理子图层 (新旧版通用)
-            if obj.get('layers'):
-                for layer in obj['layers']:
-                    find_slices(layer, current_name, current_path)
-
-            # 递归处理所有对象属性 (旧版兼容)
-            for value in obj.values():
-                if isinstance(value, dict) and value != obj:
-                    find_slices(value, parent_name, layer_path)
-                elif isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, dict):
-                            find_slices(item, parent_name, layer_path)
+            # 仅递归标准子图层字段，避免 style.fills 等属性被误识别为切图
+            for child_key in ('layers', 'children'):
+                for child in (obj.get(child_key) or []):
+                    if isinstance(child, dict):
+                        find_slices(child, current_name, current_path)
 
         # 新版结构: 从 artboard.layers 开始查找 (优先)
         if sketch_data.get('artboard') and sketch_data['artboard'].get('layers'):
@@ -3061,6 +3172,101 @@ class LanhuExtractor:
         elif sketch_data.get('info'):
             for item in sketch_data['info']:
                 find_slices(item)
+
+        # Photoshop：蓝湖在根节点 type=ps，切图登记在 assets[]（isSlice），
+        # 实际 PNG/SVG 地址在对应 id 的图层 images.png_xxxhd / images.svg（与 convert_sketch_to_html 一致）
+        if str(sketch_data.get('type') or '').lower() == 'ps':
+            by_id: dict = {}
+
+            def _index_ps(obj):
+                if not isinstance(obj, dict):
+                    return
+                oid = obj.get('id')
+                if oid is not None:
+                    by_id[oid] = obj
+                for k in ('layers', 'children'):
+                    for c in (obj.get(k) or []):
+                        if isinstance(c, dict):
+                            _index_ps(c)
+
+            board = sketch_data.get('board')
+            if isinstance(board, dict):
+                _index_ps(board)
+            for sec in sketch_data.get('info') or []:
+                if isinstance(sec, dict):
+                    _index_ps(sec)
+
+            existing_ids = {s.get('id') for s in slices}
+
+            for asset in sketch_data.get('assets') or []:
+                if not isinstance(asset, dict) or not asset.get('isSlice'):
+                    continue
+                lid = asset.get('id')
+                if lid is None or lid in existing_ids:
+                    continue
+                layer = by_id.get(lid)
+                if not isinstance(layer, dict):
+                    continue
+                imgs = layer.get('images') or {}
+                download_url = imgs.get('png_xxxhd') or imgs.get('svg')
+                if not download_url:
+                    continue
+
+                lw_raw = float(layer.get('width') or 0)
+                lh_raw = float(layer.get('height') or 0)
+                if lw_raw <= 0 or lh_raw <= 0:
+                    bb = asset.get('bounds') or {}
+                    lw_raw = float(bb.get('right', 0)) - float(bb.get('left', 0))
+                    lh_raw = float(bb.get('bottom', 0)) - float(bb.get('top', 0))
+                base_w = max(1.0, lw_raw)
+                base_h = max(1.0, lh_raw)
+                logical_w = max(1.0, base_w / 2)
+                logical_h = max(1.0, base_h / 2)
+
+                disp_name = asset.get('name') or layer.get('name') or 'slice'
+                size_str = f"{int(round(base_w))}x{int(round(base_h))}"
+                slice_info = {
+                    'id': lid,
+                    'name': disp_name,
+                    'type': layer.get('type') or 'ps-slice',
+                    'download_url': download_url,
+                    'size': size_str,
+                    'format': 'png' if imgs.get('png_xxxhd') else 'svg',
+                }
+                if imgs.get('png_xxxhd') and imgs.get('svg'):
+                    slice_info['svg_url'] = imgs['svg']
+
+                if 'left' in layer and 'top' in layer:
+                    slice_info['position'] = {
+                        'x': int(round(float(layer.get('left', 0)))),
+                        'y': int(round(float(layer.get('top', 0)))),
+                    }
+
+                slice_info['layer_path'] = disp_name
+
+                if include_metadata:
+                    md = {'source': 'photoshop', 'asset_id': lid}
+                    if asset.get('scaleType') is not None:
+                        md['scaleType'] = asset.get('scaleType')
+                    slice_info['metadata'] = md
+
+                if imgs.get('png_xxxhd'):
+                    scale_urls = self._build_ps_scale_urls(download_url, base_w, base_h)
+                    if scale_urls:
+                        slice_info['scale_urls'] = scale_urls
+                    slice_info['logical_size'] = {
+                        'width': int(round(logical_w)),
+                        'height': int(round(logical_h)),
+                        'note': '1x logical px; PS slice base px equals iOS @2x / Android xhdpi',
+                    }
+                    slice_info['base_size'] = {
+                        'width': int(round(base_w)),
+                        'height': int(round(base_h)),
+                        'note': 'PS slice base px; equals iOS @2x / Android xhdpi',
+                    }
+
+                slices.append(slice_info)
+                existing_ids.add(lid)
 
         return {
             'design_id': image_id,
@@ -5077,6 +5283,8 @@ async def lanhu_get_ai_analyze_design_result(
         summary_text += "STEP 2 - 下载图片资源到本地（必须在生成代码前完成）：\n"
         summary_text += "  下方每个设计图的 HTML 代码中，图片已替换为本地路径（./assets/slices/xxx.png）\n"
         summary_text += "  每个设计图下方附有「图片资源下载映射」，列出 本地路径 ← 远程下载地址\n"
+        summary_text += "  文件名已按 CSS 类名生成（如 thumbnail_54.png、group_1.png），具备初步语义。\n"
+        summary_text += "  ⚠️ 若文件名仍不够语义化，在下载时重命名为更清晰的英文名，并同步更新 HTML 中的路径引用。\n"
         summary_text += "  必须按映射表下载所有图片到项目本地 assets 目录：\n"
         summary_text += "    macOS/Linux → curl -o <path> \"<url>\"\n"
         summary_text += "    Windows → PowerShell Invoke-WebRequest -Uri \"<url>\" -OutFile <path>\n"
@@ -5303,16 +5511,43 @@ async def lanhu_get_design_slices(
         image_id_from_url = params.get('doc_id')  # parse_url 会把 image_id 解析为 doc_id
 
         # 3. 查找指定的设计图
-        # 支持：精确名称匹配、image_id 匹配（当 design_name 为空或 URL 中有 image_id 时）
+        # 支持：精确名称匹配、index 数字匹配、模糊/归一化匹配、image_id 匹配
         target_design = None
+        design_name_stripped = design_name.strip()
 
-        # 先尝试按名称匹配
-        for design in designs_data['designs']:
-            if design['name'] == design_name:
-                target_design = design
-                break
+        # 3a. 尝试按 index 数字匹配
+        if design_name_stripped.isdigit():
+            idx = int(design_name_stripped)
+            for design in designs_data['designs']:
+                if design.get('index') == idx:
+                    target_design = design
+                    break
 
-        # 如果名称没匹配到，尝试使用 URL 中的 image_id
+        # 3b. 尝试精确名称匹配
+        if not target_design:
+            for design in designs_data['designs']:
+                if design['name'] == design_name_stripped:
+                    target_design = design
+                    break
+
+        # 3c. 尝试归一化引号后匹配（解决框架转换中文引号的问题）
+        if not target_design:
+            import unicodedata
+            def normalize_quotes(s):
+                return s.replace('\u201c', '"').replace('\u201d', '"').replace('\u2018', "'").replace('\u2019', "'")
+            normalized_input = normalize_quotes(design_name_stripped)
+            for design in designs_data['designs']:
+                if normalize_quotes(design['name']) == normalized_input:
+                    target_design = design
+                    break
+
+        # 3d. 尝试子串包含匹配（输入是设计名的一部分）
+        if not target_design:
+            matches = [d for d in designs_data['designs'] if design_name_stripped in d['name']]
+            if len(matches) == 1:
+                target_design = matches[0]
+
+        # 3e. 如果名称没匹配到，尝试使用 URL 中的 image_id
         if not target_design and image_id_from_url:
             for design in designs_data['designs']:
                 if design.get('id') == image_id_from_url:
@@ -5403,25 +5638,35 @@ async def lanhu_get_design_slices(
                 },
                 {
                     "step": 3,
-                    "title": "Smart Naming Strategy",
-                    "description": "Generate semantic filenames based on layer_path, parent_name, size",
-                    "examples": [
-                        {
-                            "layer_path": "TopStatusBar/Battery/Border",
-                            "size": "26x14",
-                            "suggested_name": "status_bar_battery_border_26x14.png"
-                        },
-                        {
-                            "layer_path": "Button/Background",
-                            "size": "200x50",
-                            "suggested_name": "button_background_200x50.png"
-                        }
+                    "title": "文件命名规范",
+                    "primary_rule": "根据用户项目命名规范对 slice.name 进行语义化英文重命名，再加倍率后缀",
+                    "naming_workflow": [
+                        "1. 读取用户项目已有切图/资源文件，识别命名风格（snake_case / camelCase / kebab-case 等）",
+                        "2. 将 slice.name（可能是中文）翻译并语义化为英文，遵循识别到的命名风格",
+                        "3. 无法识别风格时默认 snake_case（如 icon_share、btn_confirm、img_empty_state）",
+                        "4. 加倍率后缀"
                     ],
-                    "naming_patterns": {
-                        "icons": "icon_xxx.png",
-                        "backgrounds": "bg_xxx.png",
-                        "buttons": "btn_xxx.png"
-                    }
+                    "scale_suffix_convention": {
+                        "Web 1x":  "{name}.png",
+                        "Web 2x":  "{name}@2x.png",
+                        "Web 3x":  "{name}@3x.png",
+                        "iOS @1x": "{name}.png",
+                        "iOS @2x": "{name}@2x.png",
+                        "iOS @3x": "{name}@3x.png",
+                        "Android mdpi":    "mipmap-mdpi/{name}.png",
+                        "Android hdpi":    "mipmap-hdpi/{name}.png",
+                        "Android xhdpi":   "mipmap-xhdpi/{name}.png",
+                        "Android xxhdpi":  "mipmap-xxhdpi/{name}.png",
+                        "Android xxxhdpi": "mipmap-xxxhdpi/{name}.png"
+                    },
+                    "rename_examples": [
+                        {"slice_name": "线",           "renamed": "icon_line",            "Web 2x": "icon_line@2x.png"},
+                        {"slice_name": "img_成功申请精装", "renamed": "img_apply_success",   "Web 2x": "img_apply_success@2x.png"},
+                        {"slice_name": "申请被驳回",    "renamed": "img_apply_rejected",   "Web 2x": "img_apply_rejected@2x.png"},
+                        {"slice_name": "草地大背景",    "renamed": "bg_grass",             "Web 2x": "bg_grass@2x.png"},
+                        {"slice_name": "icon-导出",     "renamed": "icon_export",          "Web 2x": "icon_export@2x.png"}
+                    ],
+                    "duplicate_handling": "同名切图加序号后缀：icon_line.png / icon_line_2.png / icon_line_3.png"
                 },
                 {
                     "step": 4,
@@ -6166,11 +6411,17 @@ async def lanhu_get_members(
     }
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok"})
+
+
 if __name__ == "__main__":
     # 运行MCP服务器
     # 使用HTTP传输方式，支持环境变量配置
     SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-    SERVER_PORT = int(os.getenv("SERVER_PORT", "8100"))
+    SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
     mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
 
 
